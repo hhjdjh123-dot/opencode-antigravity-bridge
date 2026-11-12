@@ -16,6 +16,8 @@ import { ACCOUNT_ACTIONS, ACCOUNT_NAME_PROMPT } from "./account-ui.mjs"
 import { selectAgy } from "./context-unlock.mjs"
 import { sanitizeSystemPrompt } from "./prompt-guard.mjs"
 import { classifyUpstreamError } from "./upstream-error.mjs"
+import { startLogin } from "./login.mjs"
+import { startCleanupScheduler } from "./cleanup.mjs"
 import { latestGenerationIdx, latestModelStep, modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { OutputLimitFilter } from "./output-limit.mjs"
 import { AgentNoticeFilter } from "./agent-notice.mjs"
@@ -155,7 +157,9 @@ function contextWindow(model) {
   const requested = Number(process.env.AGY_BRIDGE_CONTEXT_WINDOW)
   const window = Number.isSafeInteger(requested) && requested > 0 && requested <= 1_048_576
     ? requested : (agyUnlocked() ? UNLOCKED_CONTEXT_WINDOW : DEFAULT_CONTEXT_WINDOW)
-  return /^gpt-oss-120b(?:-|$)/i.test(model) ? Math.min(window, 131_072) : window
+  if (/^gpt-oss-120b(?:-|$)/i.test(model)) return Math.min(window, 131_072)
+  if (/^claude-/i.test(model)) return Math.min(window, 200_000)
+  return window
 }
 
 // The agy binary is chosen once per bridge process: the official install, or the
@@ -261,6 +265,9 @@ async function listAgyModels(agyPath, extraArgs = []) {
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 const catalogCache = new Map()
 const offeredProbes = new Map()
+// Local: the probe spawns agy and completes an ACP handshake (~4s on a real
+// account); 500ms only ever timed out. Override with AGY_BRIDGE_PROBE_WAIT_MS.
+const OFFERED_PROBE_WAIT_MS = positiveTimeout(process.env.AGY_BRIDGE_PROBE_WAIT_MS, 6000)
 
 async function probeOfferedModels(agyPath, account) {
   const key = `${wslDistro() || "native"}|${agyPath}|${account.key}`
@@ -815,6 +822,11 @@ class Turn {
     this.clientProgressAt = this.lastProgressAt
     this.deadlineAt = null
     this.baseHistory = trailingMessages({ messages }).history.map((message) => ({ ...message }))
+    // An assistant prefill run is answered as one assistant message: the
+    // client resends prefill + reply merged, so the ledger must match that.
+    const pRun = prefillTailEnabled() ? prefillRun(messages) : null
+    this.prefillRunStart = pRun ? pRun.runStart : -1
+    this.prefillText = pRun ? messages.slice(pRun.runStart).map((m) => assistantTextOf(m) || "").join("") : ""
     this.events = []
     this.waiters = []
     this.calls = []
@@ -1556,6 +1568,26 @@ class Proc {
 
   recordAssistantResponse(turn, content) {
     if (this.turn === turn && this.expectedMessages) {
+      if (typeof turn.prefillRunStart === "number" && turn.prefillRunStart >= 0 &&
+        turn.prefillRunStart <= this.expectedMessages.length) {
+        let merged = content
+        if (turn.prefillText) {
+          if (Array.isArray(content) && content[0]?.type === "text") {
+            merged = [{ ...content[0], text: turn.prefillText + (content[0].text || "") }, ...content.slice(1)]
+          } else if (Array.isArray(content)) {
+            merged = [{ type: "text", text: turn.prefillText }, ...content]
+          } else {
+            merged = turn.prefillText + String(content ?? "")
+          }
+        }
+        this.expectedMessages.splice(
+          turn.prefillRunStart,
+          this.expectedMessages.length - turn.prefillRunStart,
+          { role: "assistant", content: merged },
+        )
+        turn.prefillRunStart = -1
+        return
+      }
       this.expectedMessages.push({ role: "assistant", content })
     }
   }
@@ -2116,7 +2148,7 @@ class Proc {
 
   canPark() {
     return !!this.sessionId && this.hasSentFirstTurn && !this.historyInvalid && !this.turn &&
-      !this.dead && !this.steering && Array.isArray(this.expectedMessages)
+      !this.dead && !this.steering && Array.isArray(this.expectedMessages) && this.expectedMessages.length > 0
   }
 
   stop() {
@@ -2511,7 +2543,7 @@ function reclaimedRouteHash(convKey, opts, history = opts.history, originalIds =
   if (identity === null) return null
   return digest(stableJSON({
     family: convKey.split(":fork:")[0], account: opts.account ?? null,
-    workDir: opts.workDir ?? null, instructions: compactIdentity(opts.instructions),
+    workDir: opts.workDir ?? null, instructions: instructionsIdentity(opts.instructions),
     history: identity,
   }))
 }
@@ -2577,6 +2609,19 @@ async function evictLRU() {
 }
 
 setInterval(() => { evictIdle().catch(() => {}) }, 60_000).unref()
+startCleanupScheduler(() => ({
+  stateFile: sessionStateFile(),
+  shimDir,
+  activeWorkspaces: [...allProcs].map((p) => p.workspace).filter(Boolean),
+  activeSessionIds: [
+    ...[...allProcs].map((p) => p.sessionId),
+    ...[...parked.values()].map((e) => e?.sessionId),
+  ].filter(Boolean),
+  geminiDirs: [
+    path.join(os.homedir(), ".gemini"),
+    ...listAccounts().map((a) => a.dir || (a.home ? path.join(a.home, ".gemini") : null)).filter(Boolean),
+  ],
+}))
 
 const acquireLocks = new Map()
 
@@ -3050,8 +3095,24 @@ function stripAgentClockLines(text) {
 
 // System prompt and session instructions: billing headers plus known agent
 // clock lines. User text is never passed through this helper.
+const HERMES_VOLATILE_LINE_RE = /^[ \t]*(?:Conversation started:\s+.*|(?:Model|Provider|Platform):\s+.*)$/i
+const HERMES_MEMORY_HEADER_RE = /^([ \t]*(?:MEMORY \(your personal notes\)|USER PROFILE \(who the user is\)))\s+\[\d+%\s*[-–—]\s*[\d,]+\/[\d,]+\s*chars\][ \t]*$/gm
+
+// Hermes stamps its system prompt with the conversation start time, model,
+// provider, platform and memory usage percentages. Those lines change between
+// otherwise identical requests and would otherwise break session reuse.
+function stripHermesVolatileSystemLines(text) {
+  const s = String(text ?? "")
+  if (!s) return s
+  const normalized = s.replace(HERMES_MEMORY_HEADER_RE, "$1")
+  return normalized
+    .split(/(\n)/)
+    .map((part) => (part === "\n" || !HERMES_VOLATILE_LINE_RE.test(part) ? part : ""))
+    .join("")
+}
+
 function stripVolatileSystem(text) {
-  return stripAgentClockLines(stripBillingHeader(text))
+  return stripHermesVolatileSystemLines(stripAgentClockLines(stripBillingHeader(text)))
 }
 
 function instructionsIdentity(text) {
@@ -3522,7 +3583,7 @@ function promptAttemptKey(convKey, body, trailing, model, selection, tools, inst
     model,
     selection,
     tools,
-    instructions: compactIdentity(instructions),
+    instructions: instructionsIdentity(instructions),
   }))
 }
 
@@ -5210,6 +5271,53 @@ function expandHome(value) {
   return text === "~" || text.startsWith("~/") ? path.join(os.homedir(), text.slice(1)) : text
 }
 
+async function probeSignedIn(agy) {
+  const probe = await execOnce(agy, ["models"], { timeoutMs: 15_000 })
+  if (probe.err || probe.code !== 0 || !probe.stdout.trim()) {
+    const why = probe.timedOut
+      ? "timed out after 15s"
+      : (probe.stderr || probe.stdout || "").trim() || probe.err?.message || "unknown error"
+    return { ok: false, why }
+  }
+  return { ok: true, why: "" }
+}
+
+// Re-sign the default agy account from Magpie's UI (local enhancement): the
+// named-account flow in accounts-login.mjs never touches the default login.
+const DEFAULT_GOOGLE_LOGIN_METHOD = {
+  type: "oauth",
+  label: "Sign in with Google",
+  authorize: async () => {
+    const agy = findAgy()
+    if (!agy) {
+      return {
+        type: "failed",
+        error: "agy CLI not found. Install Antigravity CLI first: https://antigravity.google/docs/cli",
+      }
+    }
+    if ((await probeSignedIn(agy)).ok) {
+      return { url: "", instructions: "", method: "auto", callback: async () => ({ type: "success", key: "agy" }) }
+    }
+    const login = await startLogin(agy)
+    if (login.error) return { type: "failed", error: login.error }
+    return {
+      url: login.url,
+      instructions: "",
+      method: "code",
+      callback: async (code, opts = {}) => {
+        const done = await login.finish(code, { signal: opts.signal })
+        if (done.error) return { type: "failed", error: done.error }
+        const probe = await probeSignedIn(agy)
+        if (!probe.ok) return { type: "failed", error: `agy signed in, but ${probe.why}` }
+        accountsCache = null
+        catalogCache.clear()
+        invalidateAccounts()
+        return { type: "success", key: "agy" }
+      },
+    }
+  },
+}
+
 export const AntigravityBridgePlugin = async (input = {}) => {
   const magpie = !!input.magpie
   const native = magpie && !wslDistro()
@@ -5250,6 +5358,18 @@ export const AntigravityBridgePlugin = async (input = {}) => {
     invalidateAccounts()
     catalogCache.clear()
   } })
+  if (process.env.AGY_BRIDGE_PREWARM === "1") {
+    const t = setTimeout(() => {
+      const agy = findAgy()
+      if (!agy || allProcs.size > 0) return
+      acquireProc(agy, "__prewarm__", {
+        model: null, selection: null, tools: [], workDir: null, instructions: "",
+        history: [], messages: [], layout: null, nonstream: false,
+        account: null, geminiDir: null,
+      }, true, false).catch(() => {})
+    }, 100)
+    t.unref?.()
+  }
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -5294,7 +5414,7 @@ export const AntigravityBridgePlugin = async (input = {}) => {
             return { type: "success", key: "agy" }
           },
         },
-        ...(wslDistro() ? [] : [...accountImportMethods(importEntries), accountLogin]),
+        ...(wslDistro() ? [] : [...accountImportMethods(importEntries), accountLogin, DEFAULT_GOOGLE_LOGIN_METHOD]),
         ...(native ? [{
           type: "api", keyless: true, ...ACCOUNT_ACTIONS.saved,
           prompts: [{ type: "text", key: "name", message: "Saved Bridge account name (no new Google sign-in)",
@@ -5637,10 +5757,14 @@ export const AntigravityBridgePlugin = async (input = {}) => {
           const catalog = agy ? await loadModelCatalog(agy, true, account) : buildModelCatalog(FALLBACK_MODELS)
           const offered = agy ? await Promise.race([
             probeOfferedModels(agy, account),
-            new Promise(resolve => setTimeout(() => resolve(null), 500)),
+            new Promise(resolve => setTimeout(() => resolve(null), OFFERED_PROBE_WAIT_MS)),
           ]) : null
           const offeredIds = new Set((offered || []).map(item => item.id))
-          const available = offered ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : catalog.models.filter(item => /^gemini-/i.test(item.id))
+          // Local: only a probe that answered may narrow; a timed-out/empty probe keeps
+          // the whole `agy models` catalog (upstream narrowed to /^gemini-/, which
+          // delisted Claude/GPT-OSS on every relist; cf. closed PR #52).
+          const narrowed = !!offered && offeredIds.size > 0
+          const available = narrowed ? catalog.models.filter(item => offeredIds.has(item.id) || catalog.routes.get(item.id)?.byEffort && [...catalog.routes.get(item.id).byEffort.values()].some(id => offeredIds.has(id))) : [...catalog.models]
           const covered = new Set(available.flatMap(item => [item.id, ...[...(catalog.routes.get(item.id)?.byEffort?.values() || [])]]))
           for (const item of offered || []) if (!covered.has(item.id)) available.push({ id: item.id, name: item.name || item.id })
           for (const model of available) {

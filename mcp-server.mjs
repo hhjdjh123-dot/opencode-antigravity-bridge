@@ -1,3 +1,5 @@
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 import fs from "node:fs"
 import net from "node:net"
 
@@ -289,6 +291,60 @@ async function listTools(message, hasId) {
   }
 }
 
+
+function sliceUtf8Head(buf, maxBytes) {
+  if (maxBytes <= 0) return ""
+  if (buf.length <= maxBytes) return buf.toString("utf8")
+  let end = maxBytes
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--
+  return buf.subarray(0, end).toString("utf8")
+}
+
+function sliceUtf8Tail(buf, maxBytes) {
+  if (maxBytes <= 0) return ""
+  if (buf.length <= maxBytes) return buf.toString("utf8")
+  let start = buf.length - maxBytes
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++
+  return buf.subarray(start).toString("utf8")
+}
+
+export function capMcpToolResultText(text, maxBytes = 9500) {
+  if (typeof text !== "string" || !Number.isFinite(maxBytes) || maxBytes <= 0) return text
+  const buf = Buffer.from(text, "utf8")
+  if (buf.length <= maxBytes) return text
+  const probeMarker = `\n...[Bridge omitted ${buf.length} of ${buf.length} UTF-8 bytes to stay under agy's 10KB inline MCP cap; narrow offset/limit or filter in script if middle lines are needed]...\n`
+  const markerReserve = Buffer.byteLength(probeMarker, "utf8") + 16
+  if (maxBytes <= markerReserve + 32) return sliceUtf8Head(buf, maxBytes)
+  const budget = maxBytes - markerReserve
+  const headText = sliceUtf8Head(buf, Math.floor(budget * 0.65))
+  const tailText = sliceUtf8Tail(buf, budget - Buffer.byteLength(headText, "utf8"))
+  const keptBytes = Buffer.byteLength(headText, "utf8") + Buffer.byteLength(tailText, "utf8")
+  const omittedBytes = Math.max(0, buf.length - keptBytes)
+  const marker = `\n...[Bridge omitted ${omittedBytes} of ${buf.length} UTF-8 bytes to stay under agy's 10KB inline MCP cap; narrow offset/limit or filter in script if middle lines are needed]...\n`
+  return headText + marker + tailText
+}
+
+function mcpToolResultByteCap() {
+  const raw = process.env.AGY_BRIDGE_MAX_TOOL_RESULT_BYTES
+  if (raw === undefined || raw === "") return 9500
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 9500
+}
+
+function capMcpResultPayload(result) {
+  const limit = mcpToolResultByteCap()
+  if (limit <= 0 || !result || typeof result !== "object" || !Array.isArray(result.content)) return result
+  let changed = false
+  const content = result.content.map((item) => {
+    if (!item || item.type !== "text" || typeof item.text !== "string") return item
+    const capped = capMcpToolResultText(item.text, limit)
+    if (capped === item.text) return item
+    changed = true
+    return { ...item, text: capped }
+  })
+  return changed ? { ...result, content } : result
+}
+
 async function callTool(message, hasId) {
   const params = message.params
   if (!isObject(params)
@@ -323,7 +379,7 @@ async function callTool(message, hasId) {
     const outcome = await request.promise
     if (inputClosed || request.cancelled || !hasId) return
     if (outcome.error) sendError(message.id, outcome.error)
-    else sendResult(message.id, outcome.result)
+    else sendResult(message.id, capMcpResultPayload(outcome.result))
   } finally {
     if (hasId && pendingCalls.get(message.id) === request) pendingCalls.delete(message.id)
   }
@@ -442,8 +498,11 @@ function handleInput(chunk) {
   }
 }
 
-process.stdin.on("data", handleInput)
-process.stdin.on("end", closeInput)
-process.stdin.on("close", closeInput)
-process.stdin.on("error", closeInput)
-process.stdout.on("error", handleStdoutError)
+const isMainModule = Boolean(process.argv[1]) && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])
+if (isMainModule) {
+  process.stdin.on("data", handleInput)
+  process.stdin.on("end", closeInput)
+  process.stdin.on("close", closeInput)
+  process.stdin.on("error", closeInput)
+  process.stdout.on("error", handleStdoutError)
+}
