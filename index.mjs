@@ -5414,7 +5414,7 @@ export const AntigravityBridgePlugin = async (input = {}) => {
             return { type: "success", key: "agy" }
           },
         },
-        ...(wslDistro() ? [] : [...accountImportMethods(importEntries), accountLogin, DEFAULT_GOOGLE_LOGIN_METHOD]),
+        ...(wslDistro() ? [] : [...accountImportMethods(importEntries), accountLogin]),
         ...(native ? [{
           type: "api", keyless: true, ...ACCOUNT_ACTIONS.saved,
           prompts: [{ type: "text", key: "name", message: "Saved Bridge account name (no new Google sign-in)",
@@ -5438,6 +5438,9 @@ export const AntigravityBridgePlugin = async (input = {}) => {
             }
           },
         }] : []),
+        // Local: re-sign the default agy account from Magpie's UI; kept last so
+        // upstream's method indices are unchanged.
+        ...(wslDistro() ? [] : [DEFAULT_GOOGLE_LOGIN_METHOD]),
       ],
       loader: async getAuth => {
         return {

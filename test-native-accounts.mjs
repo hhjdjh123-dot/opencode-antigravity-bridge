@@ -27,7 +27,7 @@ test("native Magpie accounts share model IDs and isolate auth, tools, usage and 
     Object.assign(process.env, saved)
   })
   assert.equal(plugin.auth.single, false)
-  assert.equal(plugin.auth.methods.length, 5)
+  assert.equal(plugin.auth.methods.length, 6)
   const cancelled = new AbortController()
   cancelled.abort()
   assert.equal((await plugin.auth.methods[1].authorize({ name: "cancelled", source: f.source }, { signal: cancelled.signal })).type, "failed")
